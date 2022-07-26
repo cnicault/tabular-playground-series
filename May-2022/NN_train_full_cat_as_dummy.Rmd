@@ -1,0 +1,266 @@
+---
+title: "NN train on full data use categorical as dummy"
+author: "Christophe Nicault"
+date: '2022-05-22'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries 
+
+```{r}
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(glue)
+library(yardstick)
+library(pROC)
+library(tictoc)
+library(fastDummies)
+```
+
+Set suffix for submission
+
+```{r}
+suffix <- 1
+```
+
+## Load data
+
+```{r}
+may2022_train <- readRDS(here::here("data", "may2022_train_final.rds"))
+may2022_test <- readRDS(here::here("data", "may2022_test_final.rds"))
+```
+
+## Feature engineering bis
+
+Add extra feature engineering to test in that part.
+Dummy encode all features from f_27 to help see interaction in the infrequent modes.
+
+```{r}
+# do FE here
+
+#train_df <- sample_n(train_df, size = NROW(train_df), replace = FALSE)
+train_df <- train_df %>%
+  mutate(type = "train")
+
+test_df <- test_df %>%
+  mutate(target = NA,
+         type = "test")
+
+full <- train_df %>%
+  bind_rows(test_df)
+
+f_27_names <- colnames(full)[str_detect(colnames(full), "f_27_")]
+
+full_dummy <- dummy_cols(full, select_columns = c(f_27_names, "f_29", "f_30"))
+
+train_df <- full_dummy %>%
+  filter(type == "train") %>%
+  select(-type)
+
+test_df <- full_dummy %>%
+  filter(type == "test") %>%
+  select(-type, -target)
+
+rm(full)
+rm(full_dummy)
+gc()
+```
+
+```{r}
+may2022_train_final <- train_df
+may2022_test_final <- test_df
+
+rm(train_df)
+rm(test_df)
+gc()
+```
+
+## define function
+
+The function cosine_decay is used to decrease the learning rate with the number of epoch, using a cosine shape.
+
+```{r}
+EPOCHS_COSINEDECAY <- 160
+CYCLES <- 1
+
+cosine_decay <- function(epoch, lr){
+  lr_start <- 0.01
+  lr_end <- 0.0002
+  epochs <- EPOCHS_COSINEDECAY
+  
+  epochs_per_cycle <- epochs %/% CYCLES
+  epoch_in_cycle <- epoch %% epochs_per_cycle
+  
+  if(epochs_per_cycle > 1){
+    w = (1 + cos(epoch_in_cycle / (epochs_per_cycle-1) * pi)) / 2
+  }else{
+    w = 1
+  }
+  return(w * lr_start + (1 - w) * lr_end)
+}
+```
+
+## Main 
+
+Save the data frame as they will be removed from memory for each iteration to avoid reaching memory limit.
+
+```{r}
+test_id <- may2022_test_final$id
+
+saveRDS(may2022_test_final, here::here("wrk", "may2022_test_final.RDS"))
+saveRDS(may2022_train_final, here::here("wrk", "may2022_train_final.RDS"))
+```
+
+Run the algorithm 10 times with different seed to later average all predictions which should improve the prediction.
+For each iteration, the results are saved on disk and all object are removed from memory to avoid a crash due to memory limits.
+We will need an extra step to read all the file to create the final data frame.
+
+The NN is bigger than the previous one to deal with all the new columns created by the dummy encoding.
+
+```{r}
+tic()
+
+for(i in 1:10){
+    
+  set.seed(i*123)
+  set_random_seed(i*123)
+    
+  print(glue::glue("**** Seed {i*123} ****"))
+  
+  print(glue::glue("** Train model for seed {i*123} **"))
+    
+  train_df <- sample_n(may2022_train_final, size = NROW(may2022_train_final), replace = FALSE)
+    
+  rm(may2022_train_final)
+    
+  train_target <- train_df$target
+  train_id <- train_df$id
+  train_df$target <- NULL
+  train_df$id <- NULL
+  input_size <- length(train_df)
+  train_seed_submission <- tibble(id = train_id, target = train_target)
+    
+  preProcValues <- caret::preProcess(train_df, method = c("scale", "center"))
+
+  trainTransformed <- predict(preProcValues, train_df)
+  
+  train_mx <- as.matrix(trainTransformed)
+    
+  rm(trainTransformed, train_df)
+  invisible(gc())
+    
+model <- keras_model_sequential() %>% 
+  layer_dense(units = 256, activation = "swish", input_shape = c(input_size), kernel_regularizer = regularizer_l1(l = 20e-6)) %>% 
+  layer_dense(units = 256, activation = "swish", kernel_regularizer = regularizer_l1(l = 20e-6)) %>%
+  layer_dense(units = 256, activation = "swish", kernel_regularizer = regularizer_l1(l = 20e-6)) %>%
+  layer_dense(units = 128, activation = "swish", kernel_regularizer = regularizer_l2(l = 20e-6)) %>%
+  layer_dense(units = 64, activation = "swish", kernel_regularizer = regularizer_l2(l = 20e-6)) %>%
+  layer_dense(units = 16, activation = "swish", kernel_regularizer = regularizer_l2(l = 20e-6)) %>% 
+  layer_dense(1, activation = "sigmoid")
+  
+  optimizer <- optimizer_adam(learning_rate = 0.01)
+  
+  model %>% 
+  compile(
+    loss = "binary_crossentropy",
+    optimizer = optimizer,
+    metrics = "AUC"
+  )
+  
+  model %>% fit(
+       train_mx, 
+       train_target, 
+       epochs = 160, 
+       batch_size = 4096, 
+       shuffle = TRUE,
+       callbacks = list(
+         #callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.7, patience = 4, verbose = 1)
+         callback_learning_rate_scheduler(cosine_decay),
+         callback_terminate_on_naan()
+       )
+   )
+    
+    
+  print(glue::glue("** Predict TRAIN for seed {i} **"))
+    
+  train_predictions <- model %>% predict(train_mx)
+
+  rm(train_mx)
+  invisible(gc())  
+
+  train_seed_submission <- tibble(id = train_id, seed = rep(i*123, length(train_id)), target = train_target, pred = train_predictions)
+  
+  saveRDS(train_seed_submission, here::here("wrk", glue("train_seed_submission_{suffix}_{i}.rds")))
+    
+  print(glue::glue("** Predict TEST for seed {i} **"))
+  
+  may2022_test_final <- readRDS(here::here("wrk", "may2022_test_final.RDS"))
+  may2022_test_final$id <- NULL
+
+  testTransformed <- predict(preProcValues, may2022_test_final)
+  
+  test_predictions <- model %>% predict(as.matrix(testTransformed))
+  
+  test_seed_submission <- tibble(id = test_id, seed = rep(i*123, length(test_id)), pred = as.numeric(test_predictions))
+  
+  saveRDS(test_seed_submission, here::here("wrk", glue("test_seed_submission_{suffix}_{i}.rds")))
+
+  rm(may2022_test_final, testTransformed, test_predictions, test_seed_submission, train_predictions, train_seed_submission)
+  invisible(gc())
+    
+  if(i != 10){
+    may2022_train_final <- readRDS(here::here("wrk", "may2022_train_final.RDS"))
+  }
+
+}
+
+toc()
+```
+
+## Merge all files
+
+It was necessary to save the files for each iteration to limit memory usage.
+Creation of a dataframe containing the predictions for each seed.
+The step using the train prediction is not necessary but is created in case we need to perform analysis.
+
+```{r}
+list_file <- list.files(here::here("wrk"), full.names = TRUE)
+list_train <- list_file[str_detect(list_file, "train_seed_submission")]
+
+all_train_files <- map(list_train, readRDS, here::here("wrk/"))
+
+all_train_predictions <- reduce(all_train_files, bind_rows) %>%
+  rename(prediction = 3)
+
+saveRDS(all_train_predictions, "all_train_predictions.RDS")
+
+list_test <- list_file[str_detect(list_file, "test_seed_submission")]
+
+all_test_files <- map(list_test, readRDS, here::here("wrk/"))
+
+all_test_predictions <-  reduce(all_test_files, bind_rows) %>%
+  rename(prediction = 3) %>%
+  mutate(prediction = prediction[,1])
+
+saveRDS(all_test_predictions, here::here("output", "all_test_predictions.RDS"))
+```
+
+## Create submissions
+
+```{r}
+all_test_predictions <- all_test_predictions %>%
+  pivot_wider(id_cols = c("id"), names_from = "seed", values_from = "prediction", names_prefix = "seed_")
+
+submission <- all_test_predictions %>%
+  select(id)
+submission$target <- rowMeans(all_test_predictions[, -1])
+
+submission$target  <- str_trim(format(submission$target, scientific = FALSE))
+write_csv(submission, here::here("output", glue("submission_{suffix}_NN.csv")))
+```
+

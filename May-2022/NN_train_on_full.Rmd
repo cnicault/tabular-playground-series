@@ -1,0 +1,188 @@
+---
+title: "NN train on full data"
+author: "Christophe Nicault"
+date: '2022-05-22'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries 
+
+```{r}
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(glue)
+library(yardstick)
+library(pROC)
+library(tictoc)
+```
+
+Set suffix for submission
+
+```{r}
+suffix <- 1
+```
+
+## Load data
+
+```{r}
+may2022_train <- readRDS(here::here("data", "may2022_train_final.rds"))
+may2022_test <- readRDS(here::here("data", "may2022_test_final.rds"))
+```
+
+## Feature engineering bis
+
+Add extra feature engineering to test in that part
+
+```{r}
+# do FE here
+train_df <- may2022_train
+test_df <- may2022_test
+
+train_df <- sample_n(train_df, size = NROW(train_df), replace = FALSE)
+
+may2022_train_final <- train_df
+may2022_test_final <- test_df
+```
+
+## define function
+
+The function cosine_decay is used to decrease the learning rate with the number of epoch, using a cosine shape.
+
+```{r}
+EPOCHS_COSINEDECAY <- 150
+CYCLES <- 1
+
+cosine_decay <- function(epoch, lr){
+  lr_start <- 0.01
+  lr_end <- 0.0002
+  epochs <- EPOCHS_COSINEDECAY
+  
+  epochs_per_cycle <- epochs %/% CYCLES
+  epoch_in_cycle <- epoch %% epochs_per_cycle
+  
+  if(epochs_per_cycle > 1){
+    w = (1 + cos(epoch_in_cycle / (epochs_per_cycle-1) * pi)) / 2
+  }else{
+    w = 1
+  }
+  return(w * lr_start + (1 - w) * lr_end)
+}
+```
+
+## Main 
+
+Use the full data set to train the neural network using the NN and parameters that where valididated with kfold.
+Create 10 different models using different seed to average the predictions.
+
+```{r}
+save_test <- may2022_test_final
+
+test_id <- may2022_test_final$id
+
+may2022_test_final$id <- NULL
+
+test_kfold_submission <- tibble(id = test_id)
+```
+
+```{r}
+tic()
+
+may2022_final <- may2022_train_final
+
+for(i in 1:10){
+    
+  set.seed(i*123)
+  set_random_seed(i*123)
+    
+  print(glue::glue("**** Seed {i*123} ****"))
+  
+  train_df <- may2022_final  
+  train_df <- sample_n(train_df, size = NROW(train_df), replace = FALSE)
+    
+  train_target <- train_df$target
+  
+  train_df$target <- NULL
+  train_df$id <- NULL
+  
+  preProcValues <- caret::preProcess(train_df, method = c("scale", "center"))
+
+  trainTransformed <- predict(preProcValues, train_df)
+  
+  train_mx <- as.matrix(trainTransformed)
+  
+  model <- keras_model_sequential() %>% 
+  layer_dense(units = 64, activation = "swish", input_shape = c(length(train_df)), kernel_regularizer = regularizer_l2(l = 30e-6)) %>% 
+  layer_dense(units = 64, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+  layer_dense(units = 64, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+  layer_dense(units = 16, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>% 
+  layer_dense(1, activation = "sigmoid")
+  
+  optimizer <- optimizer_adam(learning_rate = 0.01)
+  
+  model %>% 
+  compile(
+    loss = "binary_crossentropy",
+    optimizer = optimizer,
+    metrics = "AUC"
+  )
+  
+  model %>% fit(
+       train_mx, 
+       train_target, 
+       epochs = 150, 
+       batch_size = 4096, 
+       #validation_split = 0.1,
+       shuffle = TRUE,
+       callbacks = list(
+         #callback_early_stopping(monitor='loss', patience=12, verbose = 1, mode = 'min', restore_best_weights = TRUE),
+         #callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.7, patience = 4, verbose = 1)
+         callback_learning_rate_scheduler(cosine_decay),
+         callback_terminate_on_naan()
+       )
+   )
+
+  print(glue::glue("Predict TEST for seed {i}"))
+  
+  may2022_test_final$id <- NULL
+
+  testTransformed <- predict(preProcValues, may2022_test_final)
+  
+  test_predictions <- model %>% predict(as.matrix(testTransformed))
+  
+  new_submission <- tibble(pred = test_predictions)
+  colnames(new_submission) <- c(glue::glue("fold_{i*123}") )
+  
+  test_kfold_submission <- test_kfold_submission %>% 
+    bind_cols(new_submission)
+  
+  may2022_test_final <- save_test
+
+}
+
+
+toc()
+```
+
+## Save files and predictions
+
+Average all preidctions to make final predictions.
+Save all predictions and create submission file.
+
+```{r}
+saveRDS(test_kfold_submission, here::here("output", glue("test_kfold_submission_{suffix}.rds")))
+
+names <- colnames(test_kfold_submission)
+target_col <- names[str_detect(names, "fold")]
+submission <- test_kfold_submission %>%
+  select(id)
+submission$target <- rowMeans(test_kfold_submission[, target_col])
+
+submission$target  <- str_trim(format(submission$target, scientific = FALSE))
+write_csv(submission, here::here("output", glue("submission_{suffix}_NN.csv")))
+```
+

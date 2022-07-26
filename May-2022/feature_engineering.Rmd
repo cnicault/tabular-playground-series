@@ -1,0 +1,65 @@
+---
+title: "Feature engineering"
+author: "Christophe Nicault"
+date: '2022-05-05'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(here)
+```
+
+## Load data
+
+```{r}
+may2022_df <- read_csv(here::here("data", "train.csv"))
+```
+
+## structure
+
+### Main transformations TRAIN
+
+```{r}
+tic()
+
+may2022_df <- may2022_df |> 
+  mutate(letter_count = map_int(f_27, \(x) {length(unique(str_split(x, pattern = '')[[1]]))})) |> 
+  separate(col = f_27, into = paste0("f_27_", seq(1, 10, 1)), sep = seq(1,10,1), remove = FALSE)
+
+count_letter <- may2022_df |> 
+  select(id, f_27) |> 
+  mutate(sp = map(f_27, \(x) {str_split(x, pattern = '')[[1]]})) |> 
+  unnest(cols = sp) |> 
+  group_by(id, f_27, sp) |> 
+  summarise(total = n()) |> 
+  ungroup() |> 
+  pivot_wider(id_cols = c("id", "f_27"), names_from = "sp", values_from = "total")
+
+
+count_letter[is.na(count_letter)] <- 0
+
+may2022_sep <- may2022_df %>%
+  bind_cols(select(count_letter, -id, -f_27))
+
+
+may2022_sep <- may2022_sep %>%
+  mutate(i_02_21 = ((f_02 + f_21) > 5.2) - ((f_02 + f_21)  < -5.3),
+         i_05_22 = ((f_05 + f_22) > 5.1) - ((f_05 + f_22) < -5.4),
+         i_00_01_26 = ((f_00 + f_01 + f_26) > 5.0) - ((f_00 + f_01 + f_26) < -5.0))
+
+may2022_sep <- may2022_sep |> 
+  mutate(across(.cols = where(is.character), ~ as.numeric(as.factor(.x)))) %>%
+  select(-f_27)
+
+may2022_final <- may2022_sep |> select(-any_of(LETTERS))
+
+saveRDS(may2022_final, here::here("data", "may2022_train_final.rds"))
+
+toc()
+```

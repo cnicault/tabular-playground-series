@@ -1,0 +1,210 @@
+---
+title: "LightGBM kfold"
+author: "Christophe Nicault"
+date: '2022-05-22'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries
+
+```{r}
+library(tidyverse)
+library(here)
+library(glue)
+library(lightgbm)
+library(pROC)
+library(yardstick)
+library(tictoc)
+```
+
+```{r}
+set.seed(985423)
+
+suffix <- 1
+```
+
+## Load data
+
+```{r}
+may2022_train <- readRDS(here::here("data", "may2022_train_final.rds"))
+may2022_test <- readRDS(here::here("data", "may2022_test_final.rds"))
+```
+
+## Feature engineering bis
+
+Add extra feature engineering to test in that part
+
+```{r}
+# do FE here
+train_df <- may2022_train
+test_df <- may2022_test
+
+train_df <- sample_n(train_df, size = NROW(train_df), replace = FALSE)
+
+may2022_train_final <- train_df
+may2022_test_final <- test_df
+```
+
+## LighGBM
+
+```{r}
+lgb_param <- list(objective = "binary",
+                  metric ="auc",
+                  learning_rate = 0.02,
+                  n_estimators = 1024,
+                  num_leaves = 384,
+                  lambda_l1 = 0.8,
+                  seed = 985423)
+```
+
+```{r}
+save_test <- may2022_test_final
+
+test_id <- may2022_test_final$id
+
+may2022_test_final$id <- NULL
+
+test_kfold_submission <- tibble(id = test_id)
+```
+
+10-fold
+
+```{r}
+tic()
+
+split <- sort(rep(1:10,90000))
+
+may2022_final <- may2022_train_final %>% 
+  mutate(split = split)
+
+kfold_auc <- tibble(fold = integer(), auc = numeric())
+
+for(i in 1:10){
+  
+  print(glue::glue("**** Fold {i} ****"))
+  
+  train_df <- may2022_final %>% filter(split != i) %>% select(-split)
+  valid_df <- may2022_final %>% filter(split == i) %>% select(-split)
+  
+  train_target <- train_df$target
+  valid_target <- valid_df$target
+  
+  train_df$target <- NULL
+  valid_df$target <- NULL
+  train_df$id <- NULL
+  valid_df$id <- NULL
+  
+  train_mx <- data.matrix(train_df)
+  d0 <- lgb.Dataset(train_mx, label = train_target, free_raw_data=F)
+  
+  valid_mx <-data.matrix(valid_df)
+  dval <- lgb.Dataset(valid_mx, label = valid_target, free_raw_data=F) 
+  
+  valids <- list(train = d0, valid = dval)
+  print("valid - Train model")
+  lgb <- lgb.train(params = lgb_param, data = d0, valids = valids, eval_freq = 50, early_stopping_rounds = 50, reset_data = TRUE, verbose = 1)
+  
+  print(glue::glue("Predict fold {i}"))
+  
+  oof_pred <- predict(lgb, data.matrix(valid_df))
+  
+  predictions <- tibble(target = valid_target, prob = oof_pred)
+  
+  predictions <- predictions %>% 
+    mutate(pred = ifelse(oof_pred > 0.5, 1, 0))
+
+  print("auc")  
+  roc_may <- roc(predictions$target, predictions$prob)
+  auc(roc_may)
+  
+  print("kfold auc")
+  kfold_auc <- kfold_auc %>% 
+    bind_rows(tibble(fold = i, auc = as.numeric(roc_may$auc)))
+    
+  print(glue::glue("Predict TEST for fold {i}"))
+    
+  may2022_test_final$id <- NULL
+  test_predictions <- predict(lgb, data.matrix(may2022_test_final))
+  new_submission <- tibble(pred = test_predictions)
+  colnames(new_submission) <- c(glue::glue("fold_{i}") )
+  
+  test_kfold_submission <- test_kfold_submission %>% 
+    bind_cols(new_submission)
+  
+  may2022_test_final <- save_test
+}
+
+mean(kfold_auc$auc)
+
+toc()
+```
+
+## Create submission file
+
+Average the result of prediction made with the model from the 10 folds.
+
+```{r}
+saveRDS(test_kfold_submission, glue("test_kfold_submission_{suffix}.rds"))
+
+
+names <- colnames(test_kfold_submission)
+target_col <- names[str_detect(names, "fold")]
+submission <- test_kfold_submission %>%
+  select(id)
+submission$target <- rowMeans(test_kfold_submission[, target_col])
+
+submission$target  <- str_trim(format(submission$target, scientific = FALSE))
+write_csv(submission, glue("submission_{suffix}_LGBM.csv"))
+
+print(kfold_auc)
+saveRDS(kfold_auc, glue("kfold_auc_{suffix}_LGBM.rds"))
+```
+
+
+## Hyper parameter tuning
+
+Find the best parameter for LGBM
+
+
+```{r}
+
+params <- expand_grid(objective = "binary",
+                      metric ="auc",
+                      seed = 123,
+                      num_leaves = c(192, 384, 768),
+                      learning_rate = c(0.1, 0.2),
+                      min_data_in_leaf = c(4096, 2048))
+
+tune_result <- tibble(best_iter = numeric(), auc = numeric())
+
+for(i in 1:NROW(params)){
+  lgb_param <- params[i,]
+  lgb <- lgb.train(params = lgb_param, data = d0, valids = valids, eval_freq = 50, early_stopping_rounds = 100, reset_data = TRUE, verbose = 1)
+
+# Predict
+  oof_pred <- predict(lgb, data.matrix(valid_df))
+  
+  predictions <- tibble(target = valid_target, prob = oof_pred)
+  
+  predictions <- predictions |> 
+    mutate(pred = ifelse(oof_pred > 0.5, 1, 0))
+  
+  roc_may <- roc(predictions$target, predictions$prob)
+  
+  tune_result <- tune_result |> 
+    bind_rows(tibble(best_iter = lgb$best_iter, auc = as.numeric(roc_may$auc)))
+}
+
+tune_result <- tune_result |> 
+  bind_cols(params)
+
+```
+
+
+
+
+

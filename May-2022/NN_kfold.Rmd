@@ -1,0 +1,244 @@
+---
+title: "NN kfold"
+author: "Christophe Nicault"
+date: '2022-05-11'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries 
+
+```{r}
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(glue)
+library(yardstick)
+library(pROC)
+library(tictoc)
+```
+
+Set seeds for reproducibility and suffix for submission
+
+```{r}
+set.seed(985423)
+set_random_seed(985423)
+
+suffix <- 1
+```
+
+
+## Load data
+
+Load data created with main feature engineering, that proven useful
+
+```{r}
+may2022_train <- readRDS(here::here("data", "may2022_train_final.rds"))
+may2022_test <- readRDS(here::here("data", "may2022_test_final.rds"))
+```
+
+## Feature engineering bis
+
+Add extra feature engineering to test in that part
+
+```{r}
+# do FE here
+train_df <- may2022_train
+test_df <- may2022_test
+
+train_df <- sample_n(train_df, size = NROW(train_df), replace = FALSE)
+
+may2022_train <- train_df
+may2022_test <- test_df
+```
+
+```{r}
+may2022_train_final <- may2022_train
+may2022_test_final <- may2022_test
+```
+
+## define function
+
+The function cosine_decay is used to decrease the learning rate with the number of epoch, using a cosine shape.
+
+```{r}
+EPOCHS_COSINEDECAY <- 150
+CYCLES <- 1
+
+cosine_decay <- function(epoch, lr){
+  lr_start <- 0.01
+  lr_end <- 0.0002
+  epochs <- EPOCHS_COSINEDECAY
+  
+  epochs_per_cycle <- epochs %/% CYCLES
+  epoch_in_cycle <- epoch %% epochs_per_cycle
+  
+  if(epochs_per_cycle > 1){
+    w = (1 + cos(epoch_in_cycle / (epochs_per_cycle-1) * pi)) / 2
+  }else{
+    w = 1
+  }
+  return(w * lr_start + (1 - w) * lr_end)
+}
+```
+
+## Main 
+
+Save test data to reuse it for each fold
+Initialise a data frame test_kfold_submission to store the predictions on the test data for each fold.
+
+```{r}
+save_test <- may2022_test_final
+
+test_id <- may2022_test_final$id
+
+may2022_test_final$id <- NULL
+
+test_kfold_submission <- tibble(id = test_id)
+```
+
+Train with 10 folds
+
+Predict for the test data for each fold, so it can be use to submit the predictions if the validation auc is good, averaging the predictions for each fold.
+
+```{r}
+tic()
+
+split <- sort(rep(1:10,90000))
+
+may2022_final <- may2022_train_final %>% 
+  mutate(split = split)
+
+kfold_auc <- tibble(fold = integer(), auc = numeric())
+
+for(i in 1:10){
+  
+  print(glue::glue("**** Fold {i} ****"))
+  
+  train_df <- may2022_final %>% filter(split != i) %>% select(-split)
+  valid_df <- may2022_final %>% filter(split == i) %>% select(-split)
+  
+  train_target <- train_df$target
+  valid_target <- valid_df$target
+  
+  train_df$target <- NULL
+  valid_df$target <- NULL
+  train_df$id <- NULL
+  valid_df$id <- NULL
+  
+  preProcValues <- caret::preProcess(train_df, method = c("scale", "center"))
+
+
+  trainTransformed <- predict(preProcValues, train_df)
+  validTransformed <- predict(preProcValues, valid_df)
+  
+  train_mx <- as.matrix(trainTransformed)
+  
+  model <- keras_model_sequential() %>% 
+  layer_dense(units = 64, activation = "swish", input_shape = c(length(train_df)), kernel_regularizer = regularizer_l2(l = 30e-6)) %>% 
+  layer_dense(units = 64, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+  layer_dense(units = 64, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+  layer_dense(units = 16, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>% 
+  layer_dense(1, activation = "sigmoid")
+  
+  optimizer <- optimizer_adam(learning_rate = 0.01, beta_1 = 0.8, beta_2 = 0.99)
+  
+  model %>% 
+  compile(
+    loss = "binary_crossentropy",
+    optimizer = optimizer,
+    metrics = "AUC"
+  )
+  
+  model %>% fit(
+       train_mx, 
+       train_target, 
+       epochs = 150, 
+       batch_size = 4096, 
+       validation_split = 0.1,
+       callbacks = list(
+         callback_early_stopping(monitor='val_loss', patience=12, verbose = 1, mode = 'min', restore_best_weights = TRUE),
+         #callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.7, patience = 4, verbose = 1)
+         callback_learning_rate_scheduler(cosine_decay)
+       )
+   )
+
+  ## valid
+  print(glue::glue("Predict valid for fold {i}"))
+  
+  statut_proba <- model %>% predict(as.matrix(validTransformed))
+
+  predictions <- tibble(target = valid_target, prob = statut_proba[,1])
+    
+  predictions <- predictions %>% 
+    mutate(pred = ifelse(prob > 0.5, 1, 0))
+  
+  roc_may <- roc(predictions$target, predictions$prob)
+  auc(roc_may)
+  print(as.numeric(roc_may$auc))
+  
+  predictions %>% 
+    mutate(target = as.factor(target),
+           pred = as.factor(pred)) %>% 
+    conf_mat(target, pred)
+
+  print("kfold auc")
+  kfold_auc <- kfold_auc %>% 
+    bind_rows(tibble(fold = i, auc = as.numeric(roc_may$auc)))
+  
+  ## test
+  print(glue::glue("Predict TEST for fold {i}"))
+  
+  may2022_test_final$id <- NULL
+
+  testTransformed <- predict(preProcValues, may2022_test_final)
+  
+  test_predictions <- model %>% predict(as.matrix(testTransformed))
+  
+  new_submission <- tibble(pred = test_predictions)
+  colnames(new_submission) <- c(glue::glue("fold_{i}") )
+  
+  test_kfold_submission <- test_kfold_submission %>% 
+    bind_cols(new_submission)
+  
+  may2022_test_final <- save_test
+
+}
+
+mean(kfold_auc$auc)
+
+toc()
+```
+
+
+## Save files and predictions
+
+Average all folds to make final predictions.
+Save each fold's predictions and the auc result for later use.
+
+```{r}
+saveRDS(test_kfold_submission, here::here("output", glue("test_kfold_submission_{suffix}.rds")))
+
+names <- colnames(test_kfold_submission)
+target_col <- names[str_detect(names, "fold")]
+submission <- test_kfold_submission %>%
+  select(id)
+submission$target <- rowMeans(test_kfold_submission[, target_col])
+
+submission$target  <- str_trim(format(submission$target, scientific = FALSE))
+write_csv(submission, here::here("output", glue("submission_{suffix}_NN.csv")))
+
+print(kfold_auc)
+saveRDS(kfold_auc, here::here("output", glue("kfold_auc_{suffix}_NN.rds")))
+```
+
+
+
+
+
+
+
+
