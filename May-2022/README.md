@@ -13,7 +13,7 @@ The files in this repository are :
 - NN_train_full_cat_as_dummy: second model trained on the full data
 - LightGBM_kold_hyperparam_tuning.Rmd: parameter tuning for LightGBM, not used in the submission.
 
-The final solution is an average of the two NN models.
+The final solution is an average of the two NN models and was ranked 8 on 1152 competitors (top 1%).
 
 More detail on the process on my site:
 
