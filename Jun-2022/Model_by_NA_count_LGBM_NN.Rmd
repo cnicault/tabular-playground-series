@@ -1,0 +1,318 @@
+---
+title: "Model by NA count"
+author: "Christophe Nicault"
+date: '2022-06-13'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(keras)
+library(tensorflow)
+library(lightgbm)
+library(tidyverse)
+library(glue)
+library(tictoc)
+
+options(scipen=999)
+```
+
+```{r}
+data <- read_csv(here::here("data", "data.csv"))
+data_tf <- data
+```
+
+```{r}
+lgb_param <- list(objective = "regression",
+                  boosting_type = "gbdt",
+                  metric ="rmse",
+                  learning_rate = 0.05,
+                  num_leaves = 1024,
+                  n_estimators = 20,
+                  lambda_l1 = 0.02,
+                  lambda_l2 = 0.2,
+                  seed = 123
+                  )
+
+lgb_lr <- c(0.05)
+```
+
+
+```{r}
+EPOCHS_COSINEDECAY <- 20
+EPOCHS <- 20
+CYCLES <- 1
+
+cosine_decay <- function(epoch, lr){
+  lr_start <- 0.01
+  lr_end <- 0.0002
+  epochs <- EPOCHS_COSINEDECAY
+  
+  epochs_per_cycle <- epochs %/% CYCLES
+  epoch_in_cycle <- epoch %% epochs_per_cycle
+  
+  if(epochs_per_cycle > 1){
+    w = (1 + cos(epoch_in_cycle / (epochs_per_cycle-1) * pi)) / 2
+  }else{
+    w = 1
+  }
+  return(w * lr_start + (1 - w) * lr_end)
+}
+
+optimizer <- optimizer_adam(learning_rate = 0.01)
+```
+
+
+
+```{r}
+lgbm_train <- function(variable, list_cols){
+  
+  lgb_param <- lgb_param
+  model_list <- list(model = list(), rmse = numeric(), predictions = list(), lr = numeric())
+  
+  data_split <- split_df(variable, FALSE)
+  train_idx <- data_split$train_idx
+  valid_idx <- data_split$valid_idx
+  test_idx <- data_split$test_idx
+  
+  train_df <- data_tf[train_idx, list_cols]
+  valid_df <- data_tf[valid_idx, list_cols]
+  train_target <- data[[variable]][train_idx]
+  valid_target <- data[[variable]][valid_idx]
+  train_df[[variable]] <- NULL
+  valid_df[[variable]] <- NULL
+  
+  train_mx <- data.matrix(train_df)
+  d0 <- lgb.Dataset(train_mx, label = train_target, free_raw_data=F)
+  valid_mx <-data.matrix(valid_df)
+  dval <- lgb.Dataset(valid_mx, label = valid_target, free_raw_data=F) 
+  valids <- list(train = d0, valid = dval)
+  
+  for(i in seq(1,length(lgb_lr),1)){
+    
+    lgb_param$learning_rate <- lgb_lr[i]
+    print(glue("Learning rage : {lgb_param$learning_rate}"))
+    
+    lgbv <- lgb.train(params = lgb_param, data = d0, valids = valids, eval_freq = 10, early_stopping_rounds = 50, reset_data = TRUE, verbose = 1)
+    
+    model_list[["model"]][i] <- list(lgbv)
+    oof_pred <- predict(lgbv, data.matrix(valid_df))
+    model_list[["rmse"]][i] <- yardstick::rmse_vec(valid_target, oof_pred)
+    model_list[["predictions"]][i] <- list(oof_pred)
+    model_list[["lr"]][i] <- lgb_param$learning_rate
+
+  }
+  
+  test_df <- data_tf[test_idx,] %>%
+            select(all_of(setdiff(list_cols, variable)), -row_id)
+    
+  best_model <- which(model_list$rmse == min(model_list$rmse))
+  print(glue("RMSE best model : {model_list[['rmse']][best_model]}"))
+  lgb_test <- model_list$model[best_model][[1]]
+  test_predictions <- predict(lgb_test, data.matrix(test_df))
+  print(glue("Variable {variable} updated"))
+  data_tf[test_idx, variable] <<- test_predictions
+
+  print(glue("# of NA in data_tf (updated) : {sum(is.na(data_tf[[variable]]))}"))
+  print(glue("# of NA in data (original) : {sum(is.na(data[[variable]]))}"))
+  
+  return(test_predictions)
+}
+
+
+```
+
+
+```{r}
+
+# train on imputed data
+
+NN_train <- function(variable, list_cols, by_round = FALSE, round = 0, update = FALSE){
+
+  data_split <- split_df(variable, by_round, round)
+  
+  if(length(data_split$test_idx) != 0){
+    train_idx <- data_split$train_idx
+    valid_idx <- data_split$valid_idx
+    test_idx <- data_split$test_idx
+    
+    train_df <- data_tf[train_idx, list_cols]
+    valid_df <- data_tf[valid_idx, list_cols]
+    train_target <- data[[variable]][train_idx]
+    valid_target <- data[[variable]][valid_idx]
+    train_df[[variable]] <- NULL
+    valid_df[[variable]] <- NULL
+  
+    preProcValues <- caret::preProcess(select(data, all_of(setdiff(list_cols, variable))), method = c("scale", "center"))
+  
+    trainTransformed <- predict(preProcValues, train_df)
+    validTransformed <- predict(preProcValues, valid_df)
+    
+      model <- keras_model_sequential() %>% 
+      layer_dense(units = 64, activation = "swish", input_shape = length(train_df), kernel_regularizer = regularizer_l2(l = 40e-6)) %>%
+      layer_dense(units = 64, activation = "swish", kernel_regularizer = regularizer_l2(l = 40e-6)) %>%
+      # layer_dense(units = 64, activation = "swish", kernel_regularizer = regularizer_l2(l = 40e-6)) %>%
+      # layer_dense(units = 32, activation = "swish", kernel_regularizer = regularizer_l2(l = 40e-6)) %>%      
+      layer_dense(units = 16, activation = "swish", kernel_regularizer = regularizer_l2(l = 40e-6)) %>% 
+      layer_dense(1, activation = "linear")
+    
+    model %>% 
+      compile(
+        loss = 'mean_squared_error',
+        optimizer = optimizer,
+        metrics = "mean_squared_error"
+      )
+    
+    train_mx <- as.matrix(trainTransformed)
+    
+    model %>% fit(
+         train_mx, 
+         train_target, 
+         epochs = EPOCHS, 
+         batch_size = 4096, 
+         validation_split = 0.1,
+         callbacks = list(
+           callback_early_stopping(monitor='val_mean_squared_error', patience=12, verbose = 1, mode = 'min', restore_best_weights = TRUE),
+           callback_learning_rate_scheduler(cosine_decay)
+         )
+     )
+      
+    pred_valid <- model %>% predict(as.matrix(validTransformed))
+    print(yardstick::rmse_vec(valid_target, as.numeric(pred_valid)))
+  
+    test_df <- data_tf[test_idx,] %>%
+                select(all_of(setdiff(list_cols, variable)), -row_id)
+    testTransformed <- predict(preProcValues, test_df)
+    test_predictions <- model %>% predict(as.matrix(testTransformed))
+  
+    data_tf[test_idx, variable] <<- as.numeric(test_predictions)
+    print(update)
+    if(update){
+      data[test_idx, variable] <<- as.numeric(test_predictions)
+    }
+    predictions <- tibble(`row-col` = glue("{test_idx-1}-{variable}"), value = as.numeric(test_predictions))
+    print(glue("# of NA in data_tf (updated) : {sum(is.na(data_tf[[variable]]))}"))
+    print(glue("# of NA in data (original) : {sum(is.na(data[[variable]]))}"))
+  }else{
+    print("No data for test with this round = {round} and variable {variable}")
+    predictions <- tibble(`row-col` = character(), value = numeric())
+  }
+  
+  return(predictions)
+}
+
+
+```
+
+
+```{r}
+# split on original data
+
+split_df <- function(variable, by_round = FALSE, round = 1){
+  
+  var_ts <- sym(variable)
+  
+  if(by_round){
+    
+    data$count_na <- rowSums(is.na(data))
+    
+    full_r1 <- data %>%
+      filter(count_na < round) %>%
+      filter(!is.na({{var_ts}}))
+  
+    test_idx <- data %>%
+      filter(count_na == round) %>%
+      filter(is.na({{var_ts}})) %>%
+      pull(row_id)
+    
+    data$count_na <- NULL
+    
+  }else{
+    full_r1 <- data %>%
+      filter(!is.na({{var_ts}}))
+  
+    test_idx <- data %>%
+      filter(is.na({{var_ts}})) %>%
+      pull(row_id)
+  }
+  
+  split <- floor(0.80*NROW(full_r1))
+  full_r1 <- sample_n(full_r1, NROW(full_r1))
+  train_idx <- full_r1[1:split,] %>% pull(row_id)
+  valid_idx <- full_r1[(split+1):NROW(full_r1),] %>% pull(row_id)
+  
+  return(list(train_idx = train_idx+1, valid_idx = valid_idx+1, test_idx = test_idx+1))
+}
+
+
+
+```
+
+```{r}
+submission <- tibble(`row-col` = character(), value = numeric())
+```
+
+
+```{r}
+list_variables <- colnames(data)
+filter_variables <- "F_4"
+# List of variables to predict
+response_var <- list_variables[grep("F_4",list_variables)]
+# List of features
+list_cols <- list_variables[grep("F_4",list_variables)]
+
+# Imputation with NN on 1 missing
+
+for(variable in response_var){
+  tic()
+  print(glue("Variable : {variable}"))
+  EPOCHS_COSINEDECAY <- 20
+  EPOCHS <- 20
+  result <- NN_train(variable, list_cols, by_round = TRUE, round = 1, update = TRUE)
+
+  submission1 <- submission %>% bind_rows(result)
+
+  toc()
+}
+
+# Imputation with LGBM all variables
+for(variable in response_var){
+  tic()
+  print(glue("Variable : {variable}"))
+  result <- lgbm_train(variable, list_cols)
+  toc()
+}
+
+response_var<- c("F_4_0")
+variable<- c("F_4_0")
+
+# Imputation with NN
+for(i in seq(2,9,1)){
+  print(glue("**** round {i} ****"))
+  for(variable in response_var){
+    tic()
+    print(glue("Variable : {variable} of round {i}"))
+    result <- NN_train(variable, list_cols, by_round = TRUE, round = i)
+  
+    submission2 <- submission %>% bind_rows(result)
+    
+    toc()
+  }
+  
+}
+
+```
+
+
+
+```{r}
+write_csv(data_tf, here:here("output", glue("data_tf_{filter_variables}.csv")))
+write_csv(submission, here:here("output", glue("submission_{filter_variables}_s1.csv")))
+write_csv(submission, here:here("output", glue("submission_{filter_variables}_s2.csv")))
+
+
+```

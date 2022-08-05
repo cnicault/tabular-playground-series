@@ -1,0 +1,195 @@
+---
+title: "NN trained by NA combination"
+author: "Christophe Nicault"
+date: '2022-06-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(glue)
+library(tictoc)
+```
+
+```{r}
+data <- read_csv(here::here("data", "data.csv"))
+```
+
+```{r}
+list_variables <- colnames(data)
+list_cols <- list_variables[grep("F_4",list_variables)]
+
+data <- data %>%
+   select(row_id, all_of(list_cols))
+```
+
+```{r}
+tic()
+na_col <- function(var, data){
+  
+  var_ts <- sym(var)
+  new_var_ts <- sym(glue(var, "_na"))
+  
+  data %>%
+    select({{var_ts}}) %>%
+    mutate("{{new_var_ts}}" := ifelse(is.na({{var_ts}}), var, "")) %>%
+    select(-{{var_ts}})
+    
+}
+
+data_mut <- map_dfc(list_cols, na_col, data) %>%
+  mutate(na_cols = reduce(., paste, sep = " ")) %>%
+  mutate(na_cols = str_squish(na_cols))
+
+data <- data %>% 
+  bind_cols(select(data_mut, na_cols))
+
+toc()
+```
+
+```{r}
+unique_combi <- unique(data$na_cols)[-1]
+
+data$cnt <- rowSums(is.na(data))
+```
+
+```{r}
+EPOCHS_COSINEDECAY <- 100
+EPOCHS <- 100
+CYCLES <- 1
+BATCH_SIZE <- 16384
+
+cosine_decay <- function(epoch, lr){
+  lr_start <- 0.02
+  lr_end <- 0.0001
+  epochs <- EPOCHS_COSINEDECAY
+  
+  epochs_per_cycle <- epochs %/% CYCLES
+  epoch_in_cycle <- epoch %% epochs_per_cycle
+  
+  if(epochs_per_cycle > 1){
+    w = (1 + cos(epoch_in_cycle / (epochs_per_cycle-1) * pi)) / 2
+  }else{
+    w = 1
+  }
+  return(w * lr_start + (1 - w) * lr_end)
+}
+
+optimizer <- optimizer_adam(learning_rate = 0.001)
+```
+
+```{r}
+train_basis <- data %>%
+  filter(cnt == 0) %>%
+  select(-na_cols, -cnt)
+
+split <- floor(0.80*NROW(train_basis))
+```
+
+```{r}
+submission <- tibble(`row-col` = character(), value = numeric())
+```
+
+```{r}
+part <- 1
+```
+
+```{r}
+if(part == 1){list_cols <- list_cols[1:3]}
+if(part == 2){list_cols <- list_cols[4:6]}
+if(part == 3){list_cols <- list_cols[7:9]}
+if(part == 4){list_cols <- list_cols[10:12]}
+if(part == 5){list_cols <- list_cols[13:15]}
+
+for(variable in list_cols){
+  
+  combi_var <- unique_combi[str_detect(unique_combi, variable)]
+  
+  for(combi in combi_var){
+    
+    set_cols <- str_split(combi, " ", simplify = TRUE)[,1]
+    
+    if(length(set_cols) == 1){
+      EPOCHS <- 200
+    }else if(length(set_cols) == 2){
+      EPOCHS <- 120
+    }else{
+      EPOCHS <- 80
+    }
+    
+    train_df <- train_basis[1:split,] %>%
+      select(-all_of(set_cols), -row_id)
+    train_target <- train_basis[1:split,] %>% pull(variable)
+    valid_df <- train_basis[split:NROW(train_basis),] %>%
+      select(-all_of(set_cols), -row_id)
+    valid_target <- train_basis[split:NROW(train_basis),] %>% pull(variable)
+    
+    test_df <- data %>%
+      filter(na_cols %in% combi) %>%
+      select(-all_of(set_cols), -cnt, -na_cols)
+    
+    test_row_id <- test_df$row_id
+    test_df <- test_df %>% select(-row_id)
+    
+    preProcValues <- caret::preProcess(select(train_basis[-1], -all_of(set_cols)), method = c("center", "scale"))
+    
+    trainTransformed <- predict(preProcValues, train_df)
+    validTransformed <- predict(preProcValues, valid_df)
+    testTransformed <- predict(preProcValues, test_df)
+    
+    train_mx <- as.matrix(trainTransformed)
+    
+    model <- keras_model_sequential() %>% 
+      layer_dense(units = 128, activation = "swish", input_shape = length(train_df)) %>%
+      layer_batch_normalization() %>%
+      layer_dense(units = 64, activation = "swish") %>%
+      layer_dense(units = 32, activation = "swish") %>%
+      layer_dense(units = 8, activation = "swish") %>%
+      layer_dense(1, activation = "linear")
+    
+    model %>% 
+      compile(
+        loss = 'mean_squared_error',
+        optimizer = optimizer,
+        metrics = "mean_squared_error"
+      )
+    
+    model %>% fit(
+      train_mx, 
+      train_target, 
+      epochs = EPOCHS, 
+      batch_size = BATCH_SIZE, 
+      validation_split = 0.1,
+      callbacks = list(
+        callback_early_stopping(monitor='val_mean_squared_error', patience=8, verbose = 1, mode = 'min', restore_best_weights = TRUE),
+        #callback_learning_rate_scheduler(cosine_decay),
+        callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 3, verbose = 1)
+      )
+    )
+    
+    pred_valid <- model %>% predict(as.matrix(validTransformed))
+    rmse <- yardstick::rmse_vec(valid_target, as.numeric(pred_valid))
+    print(glue("RMSE - variable {variable} and combination {reduce(combi, paste, sep = ", ")}: {rmse}"))
+    
+    test_predictions <- model %>% predict(as.matrix(testTransformed))
+    predictions <- tibble(`row-col` = glue("{test_row_id}-{variable}"), value = as.numeric(test_predictions))
+    
+    submission <- submission %>% bind_rows(predictions)
+    
+  }
+
+  
+}
+```
+
+```{r}
+write_csv(submission, glue("submission_F4_part_{part}.csv"))
+```
+

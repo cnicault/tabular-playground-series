@@ -1,0 +1,277 @@
+---
+title: "Prediction by NA count with NA filled with -1"
+author: "Christophe Nicault"
+date: '2022-06-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(keras)
+library(tensorflow)
+library(lightgbm)
+library(tidyverse)
+library(glue)
+library(tictoc)
+```
+
+```{r}
+data <- read_csv(here::here("data", "data.csv"))
+```
+
+```{r}
+list_variables <- colnames(data)
+list_cols <- list_variables[grep("F_4",list_variables)]
+
+data <- data %>%
+   select(row_id, all_of(list_cols))
+
+data$cnt <- rowSums(is.na(data))
+
+data_f4 <- data
+```
+
+```{r}
+EPOCHS_COSINEDECAY <- 200
+EPOCHS <- 200
+CYCLES <- 1
+
+cosine_decay <- function(epoch, lr){
+  lr_start <- 0.001
+  lr_end <- 0.00001
+  epochs <- EPOCHS_COSINEDECAY
+  
+  epochs_per_cycle <- epochs %/% CYCLES
+  epoch_in_cycle <- epoch %% epochs_per_cycle
+  
+  if(epochs_per_cycle > 1){
+    w = (1 + cos(epoch_in_cycle / (epochs_per_cycle-1) * pi)) / 2
+  }else{
+    w = 1
+  }
+  return(w * lr_start + (1 - w) * lr_end)
+}
+
+optimizer <- optimizer_adam(learning_rate = 0.001)
+```
+
+
+```{r}
+data_f4 <- data_f4 %>%
+  mutate(across(everything(), ~replace_na(., -1)))
+```
+
+
+```{r}
+submission <- tibble(`row-col` = character(), value = numeric())
+```
+
+
+```{r}
+na_cnt <- 1
+part <- 1
+variable <- "F_4_0"
+```
+
+
+```{r}
+
+
+for(na_cnt in seq(1,5,1)){
+  
+  predictions_all_var <- c()
+  row_id_all_var <- c()
+  col_all_var <- c()
+  
+  if(part == 1){
+    cols_to_predict <- list_cols[1:7]  
+  }else{
+    cols_to_predict <- list_cols[8:15]  
+  }
+  
+  
+  
+  for(variable in cols_to_predict){
+    
+    vars <- sym(variable)
+    
+    train_cnt0 <- data_f4 %>%
+      filter(cnt == 0) %>%
+      select(-row_id, -cnt)
+    
+    split <- floor(0.80*NROW(train_cnt0))
+
+    if(na_cnt > 1){
+      nb_repetitions <- 10
+      tic()
+      train_size <- floor(NROW(train_cnt0)/nb_repetitions)
+      mask <- c()
+      sample_na <- c(rep(NA,na_cnt-1), rep(0,14-na_cnt+1))   # 15 - variable to predict / cnt - 1 : 1 of the na in cnt is for the variable to predict
+      for(j in seq(1,train_size,1)){
+        mask <- c(mask, sample(sample_na))
+      }
+      tx <- matrix(rep(mask,nb_repetitions), nrow = train_size*nb_repetitions, byrow = TRUE)
+      save_values <- train_cnt0[1:(train_size*nb_repetitions),variable]
+      dx <- as.matrix(train_cnt0[1:(train_size*nb_repetitions),setdiff(list_cols, variable)])
+      toc()
+  
+      train_cnt <- as_tibble(tx + dx)
+      train_cnt <- train_cnt %>% bind_cols(save_values) %>% select(all_of(list_cols))
+      train_cnt <- train_cnt %>%
+        mutate(across(everything(), ~replace_na(., -1)))
+    }else{
+      train_cnt <- train_cnt0
+    }
+    
+    
+        
+    train_df <- train_cnt[1:split,]
+    valid_df <- train_cnt[split+1:NROW(train_cnt),]
+    train_target <- train_df[[variable]]
+    valid_target <- valid_df[[variable]]
+    train_df[[variable]] <- NULL
+    valid_df[[variable]] <- NULL
+    
+
+    test_row_id <- data %>%
+      filter(cnt == na_cnt, is.na({{vars}})) %>%
+      pull(row_id)
+      
+    if(length(test_row_id) == 0){
+      break
+    }
+    
+    test_df <- data_f4 %>% 
+      filter(row_id %in% test_row_id) %>%
+      select(-{{vars}}, -cnt, -row_id)
+    
+    preProcValues <- caret::preProcess(select(data_f4, all_of(setdiff(list_cols, variable))), method = c("scale", "center"))
+  
+    # trainTransformed <- predict(preProcValues, train_df)
+    # validTransformed <- predict(preProcValues, valid_df)
+    trainTransformed <- train_df
+    validTransformed <- valid_df
+
+    train_mx <- as.matrix(trainTransformed)
+    
+    if(na_cnt == 1){hidden_size <- 128}else{hidden_size <- 256}
+
+    model <- keras_model_sequential() %>% 
+        layer_dense(units = hidden_size*4, activation = "swish", input_shape = length(train_df), kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+        layer_batch_normalization() %>%
+        layer_dense(units = hidden_size*4, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+        layer_dense(units = hidden_size*4, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+        layer_dense(units = hidden_size*2, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+        layer_dense(units = hidden_size, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+        layer_dense(1, activation = "linear")
+    
+    model %>% 
+      compile(
+        loss = 'mean_squared_error',
+        optimizer = optimizer,
+        metrics = "mean_squared_error"
+      )
+
+    model %>% fit(
+     train_mx, 
+     train_target, 
+     epochs = EPOCHS, 
+     batch_size = 4096, 
+     validation_split = 0.1,
+     callbacks = list(
+       callback_early_stopping(monitor='val_mean_squared_error', patience=10, verbose = 1, mode = 'min', restore_best_weights = TRUE),
+       #callback_learning_rate_scheduler(cosine_decay),
+       callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 3, verbose = 1)
+     )
+    )
+    
+    pred_valid <- model %>% predict(as.matrix(validTransformed))
+    print(yardstick::rmse_vec(valid_target, as.numeric(pred_valid)))
+    
+    #testTransformed <- predict(preProcValues, test_df)
+    testTransformed <- test_df
+      
+    test_predictions <- model %>% predict(as.matrix(testTransformed))
+    predictions <- tibble(`row-col` = glue("{test_row_id}-{variable}"), value = as.numeric(test_predictions))
+    
+    submission <- submission %>% bind_rows(predictions)
+    
+  }
+
+}
+```
+
+
+```{r}
+write_csv(data_tf, here:here("output", glue("data_f4_13.csv")))
+write_csv(submission, here:here("output", glue("submission_F4_13.csv")))
+```
+
+
+
+```{r}
+write_csv(submission, here:here("output", glue("submission_F4.csv")))
+```
+
+## SAVE
+
+full NA -1 imputation
+
+```{r eval=FALSE, include=FALSE}
+    if(na_cnt > 1){
+      nb_repetitions <- 10
+      tic()
+      train_size <- floor(NROW(train_cnt0)/nb_repetitions)
+      mask <- c()
+      sample_na <- c(rep(NA,na_cnt-1), rep(0,14-na_cnt+1))   # 15 - variable to predict / cnt - 1 : 1 of the na in cnt is for the variable to predict
+      for(j in seq(1,train_size,1)){
+        mask <- c(mask, sample(sample_na))
+      }
+      tx <- matrix(rep(mask,nb_repetitions), nrow = train_size*nb_repetitions, byrow = TRUE)
+      save_values <- train_cnt0[1:(train_size*nb_repetitions),variable]
+      dx <- as.matrix(train_cnt0[1:(train_size*nb_repetitions),setdiff(list_cols, variable)])
+      toc()
+  
+      train_cnt <- as_tibble(tx + dx)
+      train_cnt <- train_cnt %>% bind_cols(save_values) %>% select(all_of(list_cols))
+      train_cnt <- train_cnt %>%
+        mutate(across(everything(), ~replace_na(., -1)))
+    }else{
+      train_cnt <- train_cnt0
+    }
+```
+
+half NA -1 imputation
+
+```{r eval=FALSE, include=FALSE}
+    if(na_cnt > 1){
+      nb_repetitions <- 50
+      tic()
+      train_size <- floor(NROW(train_cnt0)/(nb_repetitions*2))
+      mask <- c()
+      sample_na <- c(rep(NA,na_cnt-1), rep(0,14-na_cnt+1))   # 15 - variable to predict / cnt - 1 : 1 of the na in cnt is for the variable to predict
+      for(j in seq(1,train_size,1)){
+        mask <- c(mask, sample(sample_na))
+      }
+      mask <- c(mask, rep(0, 14*train_size))
+      tx <- matrix(rep(mask,nb_repetitions), nrow = train_size*nb_repetitions*2, byrow = TRUE)
+      train_cnt_shuffle <- sample_n(train_cnt0[1:(train_size*nb_repetitions*2),list_cols], train_size*nb_repetitions*2)
+      save_values <- train_cnt_shuffle[1:(train_size*nb_repetitions*2),variable]
+      train_cnt_shuffle[[variable]] <- NULL
+      dx <- as.matrix(train_cnt_shuffle)
+      toc()
+  
+      train_cnt <- as_tibble(tx + dx)
+      train_cnt <- train_cnt %>% bind_cols(save_values) %>% select(all_of(list_cols))
+      train_cnt <- train_cnt %>%
+        mutate(across(everything(), ~replace_na(., -1))) %>%
+        sample_n(size = NROW(train_cnt))
+    }else{
+      train_cnt <- train_cnt0
+    }
+```
+

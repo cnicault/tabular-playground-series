@@ -1,0 +1,148 @@
+---
+title: "Cross validation NN"
+author: "Christophe Nicault"
+date: '2022-06-14'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(glue)
+library(tictoc)
+
+```
+
+```{r}
+data <- read_csv(here::here("data", "data.csv"))
+```
+
+
+```{r}
+EPOCHS_COSINEDECAY <- 20
+EPOCHS <- 20
+CYCLES <- 1
+
+cosine_decay <- function(epoch, lr){
+  lr_start <- 0.01
+  lr_end <- 0.0002
+  epochs <- EPOCHS_COSINEDECAY
+  
+  epochs_per_cycle <- epochs %/% CYCLES
+  epoch_in_cycle <- epoch %% epochs_per_cycle
+  
+  if(epochs_per_cycle > 1){
+    w = (1 + cos(epoch_in_cycle / (epochs_per_cycle-1) * pi)) / 2
+  }else{
+    w = 1
+  }
+  return(w * lr_start + (1 - w) * lr_end)
+}
+
+optimizer <- optimizer_adam(learning_rate = 0.01)
+```
+
+
+
+```{r}
+variable <- "F_4_0"
+var_ts <- sym(variable)
+
+list_variables <- colnames(data)
+filter_variables <- "F_4"
+# List of variables to predict
+response_var <- list_variables[grep("F_4",list_variables)]
+# List of features
+list_cols <- list_variables[grep("F_4",list_variables)]
+```
+
+```{r}
+model <- keras_model_sequential() %>% 
+  layer_dense(units = 64, activation = "swish", input_shape = length(list_cols)-1, kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+  layer_dense(units = 64, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+  layer_dense(units = 64, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>%
+  layer_dense(units = 16, activation = "swish", kernel_regularizer = regularizer_l2(l = 30e-6)) %>% 
+  layer_dense(1, activation = "linear")
+
+model %>% 
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = optimizer,
+    metrics = "mean_squared_error"
+  )
+```
+
+
+```{r}
+
+data$count_na <- rowSums(is.na(data))
+
+full_r1 <- data %>%
+  filter(count_na < 1) %>%
+  filter(!is.na({{var_ts}}))
+
+```
+
+
+```{r}
+split <- sort(rep(1:5,NROW(full_r1)/5))
+split <- c(split, rep(5, NROW(full_r1)-length(split)))
+
+full_df <- full_r1 %>% 
+  select(all_of(list_cols)) %>%
+  sample_n(NROW(full_r1)) %>%
+  mutate(split = split)
+
+kfold_rmse <- tibble(fold = integer(), rmse = numeric())
+
+for(i in 1:5){
+  
+  print(glue("Fold {i}"))
+  
+  train_df <- full_df |> filter(split != i) |> select(-split)
+  valid_df <- full_df |> filter(split == i) |> select(-split)  
+  
+  train_target <- train_df[[variable]]
+  valid_target <- valid_df[[variable]]
+  train_df[[variable]] <- NULL
+  valid_df[[variable]] <- NULL
+    
+  preProcValues <- caret::preProcess(select(data, all_of(setdiff(list_cols, variable))), method = c("scale", "center"))
+
+  trainTransformed <- predict(preProcValues, train_df)
+  validTransformed <- predict(preProcValues, valid_df)
+  
+  train_mx <- as.matrix(trainTransformed)
+  
+  model %>% fit(
+       train_mx, 
+       train_target, 
+       epochs = EPOCHS, 
+       batch_size = 4096, 
+       validation_split = 0.1,
+       callbacks = list(
+         callback_early_stopping(monitor='val_mean_squared_error', patience=12, verbose = 1, mode = 'min', restore_best_weights = TRUE),
+         callback_learning_rate_scheduler(cosine_decay)
+       )
+   )
+  
+  pred_valid <- model %>% predict(as.matrix(validTransformed))
+  rmse <- yardstick::rmse_vec(valid_target, as.numeric(pred_valid))
+  
+  kfold_rmse <- kfold_rmse |> 
+    bind_rows(tibble(fold = i, rmse = rmse))
+  
+  print(glue("RMSE for fold {i} : {rmse}"))
+}
+
+final_rmse <- mean(kfold_rmse$rmse, na.rm = TRUE)
+print(glue("Model RMSE for variable {variable} : {final_rmse}"))
+```
+

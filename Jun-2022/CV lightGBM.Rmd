@@ -1,0 +1,110 @@
+---
+title: "Cross validation Lightgbm"
+author: "Christophe Nicault"
+date: '2022-06-14'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+
+library(lightgbm)
+library(tidyverse)
+library(glue)
+library(tictoc)
+
+```
+
+```{r}
+data <- read_csv(here::here("data", "data.csv"))
+```
+
+```{r}
+lgb_param <- list(objective = "regression",
+                  boosting_type = "gbdt",
+                  metric ="rmse",
+                  learning_rate = 0.05,
+                  num_leaves = 1024,
+                  n_estimators = 20,
+                  lambda_l1 = 0.02,
+                  lambda_l2 = 0.2,
+                  seed = 123
+                  )
+
+lgb_lr <- c(0.05)
+```
+
+
+```{r}
+variable <- "F_4_0"
+var_ts <- sym(variable)
+
+list_variables <- colnames(data)
+filter_variables <- "F_4"
+# List of variables to predict
+response_var <- list_variables[grep("F_4",list_variables)]
+# List of features
+list_cols <- list_variables[grep("F_4",list_variables)]
+```
+
+
+```{r}
+
+data$count_na <- rowSums(is.na(data))
+
+full_r1 <- data %>%
+  filter(count_na < 1) %>%
+  filter(!is.na({{var_ts}}))
+
+```
+
+
+```{r}
+split <- sort(rep(1:5,NROW(full_r1)/5))
+split <- c(split, rep(5, NROW(full_r1)-length(split)))
+
+full_df <- full_r1 %>% 
+  select(all_of(list_cols)) %>%
+  sample_n(NROW(full_r1)) %>%
+  mutate(split = split)
+
+kfold_rmse <- tibble(variable = character(), fold = integer(), rmse = numeric())
+
+for(i in 1:5){
+  
+  print(glue("Fold {i}"))
+  
+  train_df <- full_df %>% filter(split != i) %>% select(-split)
+  valid_df <- full_df %>% filter(split == i) %>% select(-split)  
+  
+  train_target <- train_df[[variable]]
+  valid_target <- valid_df[[variable]]
+  train_df[[variable]] <- NULL
+  valid_df[[variable]] <- NULL
+    
+  train_mx <- data.matrix(train_df)
+  d0 <- lgb.Dataset(train_mx, label = train_target, free_raw_data=F)
+  valid_mx <-data.matrix(valid_df)
+  dval <- lgb.Dataset(valid_mx, label = valid_target, free_raw_data=F) 
+  valids <- list(train = d0, valid = dval)
+  
+  lgb <- lgb.train(params = lgb_param, data = d0, valids = valids, eval_freq = 20, early_stopping_rounds = 50, verbose = 1)  
+    
+  pred_valid <- predict(lgb, data.matrix(valid_df))
+  rmse <- yardstick::rmse_vec(valid_target, pred_valid)
+  
+  kfold_rmse <- kfold_rmse %>%
+    bind_rows(tibble(variable = variable, fold = i, rmse = rmse))
+  
+  print(glue("RMSE for fold {i} : {rmse}"))
+}
+var_rmse <- mean(kfold_rmse$rmse[which(kfold_rmse$variable == variable)])
+print(glue("RMSE for variable {variable} : {var_rmse}"))
+final_rmse <- mean(kfold_rmse$rmse, na.rm = TRUE)
+print(glue("Model RMSE for variable {variable} : {final_rmse}"))
+```
+

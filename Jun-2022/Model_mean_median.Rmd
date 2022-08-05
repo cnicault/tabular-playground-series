@@ -1,0 +1,116 @@
+---
+title: "Model_mean_median"
+author: "Christophe Nicault"
+date: '2022-06-09'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(glue)
+library(tictoc)
+library(here)
+```
+
+```{r}
+data <- read_csv(here::here("data", "data.csv"))
+```
+
+
+```{r}
+split_df <- function(variable, round){
+  
+  var_ts <- sym(variable)
+  
+  if(round){
+    
+    data$count_na <- rowSums(is.na(data))
+    
+    full_r1 <- data %>%
+      filter(count_na == 0) %>%
+      filter(!is.na({{var_ts}}))
+  
+    test_idx <- data %>%
+      filter(count_na == 1) %>%
+      filter(is.na({{var_ts}})) %>%
+      pull(row_id)
+    
+    data$count_na <- NULL
+    
+  }else{
+    full_r1 <- data %>%
+      filter(!is.na({{var_ts}}))
+  
+    test_idx <- data %>%
+      filter(is.na({{var_ts}})) %>%
+      pull(row_id)
+  }
+  
+  split <- floor(0.80*NROW(full_r1))
+  full_r1 <- sample_n(full_r1, NROW(full_r1))
+  train_idx <- full_r1[1:split,] %>% pull(row_id)
+  valid_idx <- full_r1[(split+1):NROW(full_r1),] %>% pull(row_id)
+  
+  return(list(train_idx = train_idx+1, valid_idx = valid_idx+1, test_idx = test_idx+1))
+}
+
+
+
+```
+
+```{r}
+submission <- tibble(`row-col` = character(), value = numeric())
+```
+
+
+```{r}
+list_variables <- colnames(data)
+
+# List of features
+list_cols <- list_variables[grep("F_1|F_3",list_variables)]
+
+for(variable in list_cols){
+  tic()
+  print(glue("Variable : {variable}"))
+
+  var_mean <- mean(data[[variable]], na.rm = TRUE)
+  var_median <- median(data[[variable]], na.rm = TRUE)
+  
+  data_split <- split_df(variable, FALSE)
+  valid_target <- data[[variable]][data_split$valid_idx]
+  
+  mean_rmse <- yardstick::rmse_vec(valid_target, rep(var_mean, length(valid_target)))
+  median_rmse <- yardstick::rmse_vec(valid_target, rep(var_median, length(valid_target)))
+  
+  print(glue("mean rmse : {mean_rmse} - median rmse : {median_rmse}"))
+  if(mean_rmse >= median_rmse){
+    print(glue("using median for variable {variable}"))
+    prediction <- var_median
+  }else{
+    print(glue("using mean for variable {variable}"))
+    prediction <- var_mean
+  }
+
+  predictions <- tibble(`row-col` = glue("{data_split$test_idx-1}-{variable}"), value = prediction)
+  
+  submission <- submission %>% bind_rows(predictions)
+  
+  toc()
+}
+
+submission$value <- str_trim(format(submission$value, scientific = FALSE))
+
+
+```
+
+
+```{r}
+write_csv(submission, here::here("output", glue("submission_F1_F3.csv")))
+
+```
+
