@@ -15,5 +15,5 @@ The files in this repository are :
 
 More detail on the process on my site:
 
-[https://www.christophenicault.com/predict_missing_values/](https://www.christophenicault.com/predict_missing_values/)
+[https://www.christophenicault.com/post/predict_missing_values/](https://www.christophenicault.com/post/predict_missing_values/)
 
