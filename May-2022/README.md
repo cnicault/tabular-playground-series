@@ -17,5 +17,5 @@ The final solution is an average of the two NN models and was ranked 8 on 1152 c
 
 More detail on the process on my site:
 
-[https://www.christophenicault.com/predict_machine_state/](https://www.christophenicault.com/predict_machine_state/)
+[https://www.christophenicault.com/post/predict_machine_state/](https://www.christophenicault.com/post/predict_machine_state/)
 
